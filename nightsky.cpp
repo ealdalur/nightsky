@@ -1,17 +1,16 @@
 // nightsky.cpp -- standalone terminal star/deep-sky observing planner.
 //
 // Ranks the most rewarding celestial objects for a given night and location:
-// the Moon, the naked-eye + telescopic planets, and the Messier deep-sky
-// catalogue (galaxies, nebulae, clusters). Ranking blends how long the object
-// clears a useful altitude during the dark hours, its apparent brightness, and
-// how favourably it transits the meridian relative to the middle of the night.
+// the Moon, the planets, and ~8,600 deep-sky objects (Messier, NGC/IC,
+// Caldwell and named galaxy groups). Ranking blends how long the object clears
+// a useful altitude during the dark hours, its apparent brightness, and how
+// favourably it transits the meridian relative to the middle of the night.
 //
-// No third-party libraries. Astronomical data lives in a local binary cache
-// (nightsky.dat) that is regenerated from an embedded copy on first run, so the
-// executable is fully self-contained yet loads its catalogue from a compact
-// file in a single read.
+// No third-party libraries. The deep-sky catalogue lives only in nightsky.dat,
+// a compact binary file generated at build time by gencat.py and loaded with a
+// single read; planet and Moon positions are computed.
 //
-// Build: see build.bat (MSVC).  Usage: see printUsage() below.
+// Build: see build.bat (MSVC) or build.sh.  Usage: see printUsage() below.
 
 #include <cstdio>
 #include <cstdint>
@@ -39,12 +38,6 @@
 
 #include "nightsky_types.h"
 
-// The binary cache (nightsky.dat) is a raw dump of CatEntry records, so its
-// on-disk layout IS this struct's layout, and gencat.py packs it with the
-// matching struct format "<8s12s40si4f". Pin the size: if the struct ever
-// changes, bump kDatVersion (below) and DAT_VERSION in gencat.py together.
-static_assert(sizeof(CatEntry) == 80, "CatEntry layout changed -- bump kDatVersion");
-
 // ---------------------------------------------------------------------------
 // Math helpers
 // ---------------------------------------------------------------------------
@@ -67,9 +60,9 @@ static double tand(double d){ return tan(d2r(d)); }
 static double asind(double x){ return r2d(asin(x)); }
 static double atan2d(double y,double x){ return r2d(atan2(y,x)); }
 
-// Type labels shared with the CatEntry.type codes emitted by gencat.py.
-static const char* kTypeName[] = { "Galaxy", "Nebula", "Globular", "OpenClus", "Other" };
-static const char* typeName(int t){ return (t>=0 && t<5) ? kTypeName[t] : "?"; }
+// Type labels shared with the CatRec.type codes emitted by gencat.py.
+static const char* kTypeName[] = { "Galaxy", "Nebula", "Globular", "OpenClus", "Other", "GalGroup" };
+static const char* typeName(int t){ return (t>=0 && t<6) ? kTypeName[t] : "?"; }
 
 // ---------------------------------------------------------------------------
 // Julian date / calendar conversions (all internal times are UT in JD)
@@ -366,9 +359,9 @@ static EqPos planetEq(int idx, double jd, double* rOut=nullptr, double* ROut=nul
 enum Kind { K_FIXED, K_MOON, K_PLANET };
 
 struct Target {
-    std::string id;
-    std::string name;
-    int    type;        // CatEntry type code
+    const char* id;     // string literal or pointer into the loaded catalogue
+    const char* name;
+    int    type;        // CatRec type code
     Kind   kind;
     int    planet;      // valid when kind==K_PLANET
     // fixed-object data (also filled for moving bodies at reference time)
@@ -386,9 +379,67 @@ static EqPos targetEq(const Target& t, double jd){
 }
 
 // ---------------------------------------------------------------------------
-// Event finding: rise / transit / set within a 24h scan, plus in-window
-// visibility statistics for scoring.
+// Event finding: transit within the noon-to-noon day of the night, the rise
+// before and set after it, plus in-window visibility statistics for scoring.
+//
+// Every object is sampled on the same grid (2-minute steps), so the sidereal
+// angle at each sample is computed once per night. The grid runs 12 h either
+// side of the noon-to-noon day: an object is never more than 12 h from its
+// transit when it rises or sets, so every rise/set is found, and "no rise/set"
+// genuinely means the object never crosses the horizon (circumpolar).
+//
+// Objects are evaluated in sin(altitude) space: for a fixed object that is
+//   sin(alt) = sinLat*sinDec + cosLat*cosDec*cos(LST - RA)
+// with cos(LST - RA) expanded so each sample costs a few multiply-adds and no
+// trig. asin() is only taken for the handful of values that are reported.
 // ---------------------------------------------------------------------------
+struct SkyGrid {
+    double startJD, step;
+    int    N;
+    int    dayK0, dayK1;     // sample range of the noon-to-noon day
+    double sinLat, cosLat;
+    std::vector<double> jd, cosLst, sinLst;
+};
+
+static SkyGrid makeGrid(double noonJD, double lat, double lon){
+    SkyGrid g;
+    g.step    = 2.0 / (24.0 * 60.0);
+    int perDay = (int)(1.0 / g.step + 0.5);
+    g.startJD = noonJD - 0.5;
+    g.N       = 2 * perDay + 1;
+    g.dayK0   = perDay / 2;
+    g.dayK1   = g.dayK0 + perDay;
+    g.sinLat  = sind(lat);
+    g.cosLat  = cosd(lat);
+    g.jd.resize(g.N); g.cosLst.resize(g.N); g.sinLst.resize(g.N);
+    for (int k = 0; k < g.N; ++k){
+        double jd  = g.startJD + k * g.step;
+        double lst = gmstDeg(jd) + lon;
+        g.jd[k] = jd; g.cosLst[k] = cosd(lst); g.sinLst[k] = sind(lst);
+    }
+    return g;
+}
+
+// sin(altitude) of the target at every grid sample.
+static void sinAltSeries(const Target& t, const SkyGrid& g, double* s){
+    if (t.kind == K_FIXED){
+        double a  = g.sinLat * sind(t.dec), b = g.cosLat * cosd(t.dec);
+        double cr = b * cosd(t.ra * 15.0), sr = b * sind(t.ra * 15.0);
+        for (int k = 0; k < g.N; ++k)
+            s[k] = a + g.cosLst[k] * cr + g.sinLst[k] * sr;
+    } else {
+        for (int k = 0; k < g.N; ++k){
+            EqPos p = targetEq(t, g.jd[k]);
+            double b = g.cosLat * cosd(p.dec);
+            s[k] = g.sinLat * sind(p.dec)
+                 + g.cosLst[k] * b * cosd(p.ra * 15.0)
+                 + g.sinLst[k] * b * sind(p.ra * 15.0);
+        }
+    }
+}
+
+static double altFromSin(double s){ return asind(s > 1 ? 1 : (s < -1 ? -1 : s)); }
+
 struct Events {
     bool   hasRise, hasSet;
     double riseJD, transitJD, setJD;
@@ -399,68 +450,59 @@ struct Events {
     bool   everUp;           // rose above visThreshold at all during the window
 };
 
-static Events findEvents(const Target& t, double noonJD,
-                         double lat, double lon,
+static Events findEvents(const SkyGrid& g, const double* s,
                          double winStart, double winEnd, double visThresh){
-    const double stepMin = 2.0;
-    const double step = stepMin / (24.0 * 60.0);
-    const int N = (int)(1.0 / step) + 1;   // one full day of samples
-
+    const int N = g.N;
     Events ev{};
-    ev.hasRise = ev.hasSet = false;
-    ev.everUp = false;
-    ev.visHours = 0;
     ev.peakAlt = -999; ev.peakJD = winStart;
 
-    // Find the transit (max altitude) across the whole 24h from local noon.
-    double bestAlt = -1e9; int bestI = 0;
-    std::vector<double> alt(N);
-    for (int k = 0; k < N; ++k){
-        double jd = noonJD + k * step;
-        EqPos p = targetEq(t, jd);
-        alt[k] = altitude(p.ra, p.dec, jd, lat, lon);
-        if (alt[k] > bestAlt){ bestAlt = alt[k]; bestI = k; }
-    }
-    // Parabolic refinement of the transit time/altitude.
-    ev.transitJD = noonJD + bestI * step;
-    ev.transitAlt = bestAlt;
+    // Transit = highest sample of the day, refined with a parabola through
+    // the neighbouring altitudes.
+    int bestI = g.dayK0;
+    for (int k = g.dayK0 + 1; k <= g.dayK1; ++k) if (s[k] > s[bestI]) bestI = k;
+    ev.transitJD  = g.jd[bestI];
+    ev.transitAlt = altFromSin(s[bestI]);
     if (bestI > 0 && bestI < N-1){
-        double y0=alt[bestI-1], y1=alt[bestI], y2=alt[bestI+1];
+        double y0 = altFromSin(s[bestI-1]), y1 = ev.transitAlt, y2 = altFromSin(s[bestI+1]);
         double denom = (y0 - 2*y1 + y2);
         if (fabs(denom) > 1e-9){
             double dx = 0.5 * (y0 - y2) / denom;    // in samples
-            ev.transitJD = noonJD + (bestI + dx) * step;
+            ev.transitJD  = g.startJD + (bestI + dx) * g.step;
             ev.transitAlt = y1 - 0.25 * (y0 - y2) * dx;
         }
     }
-    // Rise: last upward crossing of 0 deg before transit.
+    // Rise: last upward crossing of the horizon before transit.
     for (int k = bestI; k > 0; --k){
-        if (alt[k] >= 0 && alt[k-1] < 0){
-            double f = (0 - alt[k-1]) / (alt[k] - alt[k-1]);
-            ev.riseJD = noonJD + (k-1 + f) * step;
+        if (s[k] >= 0 && s[k-1] < 0){
+            double f = -s[k-1] / (s[k] - s[k-1]);
+            ev.riseJD = g.startJD + (k-1 + f) * g.step;
             ev.hasRise = true;
             break;
         }
     }
-    // Set: first downward crossing of 0 deg after transit.
+    // Set: first downward crossing of the horizon after transit.
     for (int k = bestI; k < N-1; ++k){
-        if (alt[k] >= 0 && alt[k+1] < 0){
-            double f = (0 - alt[k]) / (alt[k+1] - alt[k]);
-            ev.setJD = noonJD + (k + f) * step;
+        if (s[k] >= 0 && s[k+1] < 0){
+            double f = s[k] / (s[k] - s[k+1]);
+            ev.setJD = g.startJD + (k + f) * g.step;
             ev.hasSet = true;
             break;
         }
     }
-    // In-window visibility above the photographic threshold.
-    for (int k = 0; k < N; ++k){
-        double jd = noonJD + k * step;
-        if (jd < winStart || jd > winEnd) continue;
-        if (alt[k] >= visThresh){
-            ev.visHours += stepMin / 60.0;
-            ev.everUp = true;
-        }
-        if (alt[k] > ev.peakAlt){ ev.peakAlt = alt[k]; ev.peakJD = jd; }
+    // In-window visibility above the threshold altitude.
+    int k0 = (int)ceil ((winStart - g.startJD) / g.step);
+    int k1 = (int)floor((winEnd   - g.startJD) / g.step);
+    if (k0 < 0) k0 = 0;
+    if (k1 > N-1) k1 = N-1;
+    double sThresh = sind(visThresh);
+    int peakK = -1, upSamples = 0;
+    for (int k = k0; k <= k1; ++k){
+        if (s[k] >= sThresh) ++upSamples;
+        if (peakK < 0 || s[k] > s[peakK]) peakK = k;
     }
+    ev.everUp   = upSamples > 0;
+    ev.visHours = upSamples * g.step * 24.0;
+    if (peakK >= 0){ ev.peakJD = g.jd[peakK]; ev.peakAlt = altFromSin(s[peakK]); }
     return ev;
 }
 
@@ -522,35 +564,61 @@ static void planetMagSize(int idx, double jd, double& mag, double& sizeArcmin){
 // Catalogue loading: read the binary data file produced at build time by
 // gencat.py. The catalogue lives ONLY in this file (the program embeds no
 // copy), so a missing/incompatible file is a hard error with a clear hint.
+// The file is read with a single fread and its records and strings are used
+// in place -- no per-record parsing or copying.
 // ---------------------------------------------------------------------------
-#pragma pack(push,1)
-struct DatHeader { char magic[4]; uint32_t version; uint32_t count; };
-#pragma pack(pop)
-static const uint32_t kDatVersion = 2;
+static const uint32_t kDatVersion = 3;
 static const char*    kDatPath    = "nightsky.dat";
+static const int      kTypeCount  = 6;
 
-// Returns the catalogue, or an empty vector on any failure (with *err set).
-static std::vector<CatEntry> loadCatalog(std::string& err){
+struct Catalog {
+    std::vector<char> buf;                 // the whole of nightsky.dat
+    const CatRec*     rec   = nullptr;
+    uint32_t          count = 0;
+    const char*       str   = nullptr;     // string pool
+    const char* s(uint32_t off) const { return str + off; }
+};
+
+// Returns false on any failure, with a reason in `err`.
+static bool loadCatalog(Catalog& cat, std::string& err){
     FILE* f = fopen(kDatPath, "rb");
-    if (!f){ err = "cannot open " + std::string(kDatPath); return {}; }
+    if (!f){ err = "cannot open " + std::string(kDatPath); return false; }
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (size < (long)sizeof(DatHeader)){
+        fclose(f); err = std::string(kDatPath) + " is not a valid catalogue file"; return false;
+    }
+    cat.buf.resize((size_t)size);
+    size_t got = fread(cat.buf.data(), 1, cat.buf.size(), f);
+    fclose(f);
+    if (got != cat.buf.size()){ err = std::string(kDatPath) + " could not be read"; return false; }
+
     DatHeader h;
-    if (fread(&h, sizeof(h), 1, f) != 1 || memcmp(h.magic, "NSKY", 4) != 0){
-        fclose(f); err = std::string(kDatPath) + " is not a valid catalogue file"; return {};
+    memcpy(&h, cat.buf.data(), sizeof(h));
+    if (memcmp(h.magic, "NSKY", 4) != 0){
+        err = std::string(kDatPath) + " is not a valid catalogue file"; return false;
     }
     if (h.version != kDatVersion){
-        fclose(f);
         char b[96]; snprintf(b,sizeof(b),"%s version %u, expected %u",
                              kDatPath, h.version, kDatVersion);
-        err = b; return {};
+        err = b; return false;
     }
-    if (h.count == 0 || h.count > 100000){
-        fclose(f); err = std::string(kDatPath) + " has an implausible object count"; return {};
+    uint64_t expect = sizeof(DatHeader) + (uint64_t)h.count * sizeof(CatRec) + h.strBytes;
+    if (h.count == 0 || h.strBytes == 0 || expect != (uint64_t)size ||
+        cat.buf.back() != '\0'){
+        err = std::string(kDatPath) + " is corrupt or truncated"; return false;
     }
-    std::vector<CatEntry> v(h.count);
-    size_t got = fread(v.data(), sizeof(CatEntry), h.count, f);
-    fclose(f);
-    if (got != h.count){ err = std::string(kDatPath) + " is truncated"; return {}; }
-    return v;
+    cat.rec   = reinterpret_cast<const CatRec*>(cat.buf.data() + sizeof(DatHeader));
+    cat.count = h.count;
+    cat.str   = cat.buf.data() + sizeof(DatHeader) + (size_t)h.count * sizeof(CatRec);
+    for (uint32_t i = 0; i < cat.count; ++i){
+        const CatRec& r = cat.rec[i];
+        if (r.id >= h.strBytes || r.name >= h.strBytes || r.type >= (uint32_t)kTypeCount){
+            err = std::string(kDatPath) + " is corrupt (bad record)"; return false;
+        }
+    }
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -563,8 +631,14 @@ static std::string fmtLocalHM(double jdUT, double tzHours){
     char b[8]; snprintf(b, sizeof(b), "%02d:%02d", hh, mm);
     return std::string(b);
 }
+static std::string fmtMag(double mag){
+    if (mag >= 90.0) return "--";                                           // not catalogued
+    char b[16]; snprintf(b, sizeof(b), "%.1f", mag);
+    return std::string(b);
+}
 static std::string fmtSize(double arcmin){
     char b[16];
+    if (arcmin <= 0.0) return "--";                                         // not catalogued
     if (arcmin < 1.0) snprintf(b, sizeof(b), "%.0f\"", arcmin * 60.0);       // arcsec
     else              snprintf(b, sizeof(b), "%.1f'", arcmin);               // arcmin
     return std::string(b);
@@ -652,6 +726,13 @@ static bool readCfgLocation(double& lat, double& lon){
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
+// Ranking weights (sum to 1). Brightness carries the most weight because, with
+// thousands of catalogue objects, it is what separates showpieces from filler.
+// Brightness scores 1 at mag -2 and falls linearly to 0 at kMagFaint.
+static const double kWDur     = 0.25;   // share of the dark window above threshold
+static const double kWBright  = 0.50;   // apparent magnitude
+static const double kWMerid   = 0.25;   // peak altitude, timed near mid-night
+static const double kMagFaint = 14.0;
 struct Ranked { Target t; Events ev; double score; double dispMag, dispSize; };
 
 int main(int argc, char** argv){
@@ -673,7 +754,7 @@ int main(int argc, char** argv){
     }
     if (args.size() >= 1){
         count = atoi(args[0].c_str());
-        if (count <= 0 || count > 1000){ fprintf(stderr, "Invalid count '%s'.\n\n", args[0].c_str()); printUsage(); return 1; }
+        if (count <= 0 || count > 100000){ fprintf(stderr, "Invalid count '%s'.\n\n", args[0].c_str()); printUsage(); return 1; }
     }
     if (args.size() >= 2){
         std::string digits;
@@ -728,8 +809,8 @@ int main(int argc, char** argv){
 
     // ---- load catalogue --------------------------------------------------
     std::string catErr;
-    std::vector<CatEntry> cat = loadCatalog(catErr);
-    if (cat.empty()){
+    Catalog cat;
+    if (!loadCatalog(cat, catErr)){
         fprintf(stderr,
             "nightsky: %s.\n"
             "The object catalogue file '%s' is required. Run build.bat (which\n"
@@ -765,23 +846,31 @@ int main(int argc, char** argv){
 
     // ---- build the target pool -------------------------------------------
     std::vector<Target> pool;
+    pool.reserve(cat.count + 1 + P_COUNT);
     // Moon
-    { Target t; t.id="Moon"; t.name="The Moon"; t.type=4; t.kind=K_MOON; t.planet=-1; pool.push_back(t); }
+    { Target t{}; t.id="Moon"; t.name="The Moon"; t.type=4; t.kind=K_MOON; t.planet=-1; pool.push_back(t); }
     // Planets
-    { const char* pid[P_COUNT]={"Mercury","Venus","Mars","Jupiter","Saturn","Uranus","Neptune"};
-      for (int i=0;i<P_COUNT;++i){ Target t; t.id=pid[i]; t.name=pid[i]; t.type=4; t.kind=K_PLANET; t.planet=i; pool.push_back(t); } }
+    { static const char* pid[P_COUNT]={"Mercury","Venus","Mars","Jupiter","Saturn","Uranus","Neptune"};
+      for (int i=0;i<P_COUNT;++i){ Target t{}; t.id=pid[i]; t.name=pid[i]; t.type=4; t.kind=K_PLANET; t.planet=i; pool.push_back(t); } }
     // Catalogue objects
-    for (const CatEntry& e : cat){
-        Target t; t.id=e.id; t.name=(e.name[0]?e.name:e.ngc); t.type=e.type; t.kind=K_FIXED; t.planet=-1;
+    for (uint32_t i = 0; i < cat.count; ++i){
+        const CatRec& e = cat.rec[i];
+        Target t{}; t.id=cat.s(e.id); t.name=cat.s(e.name); t.type=(int)e.type; t.kind=K_FIXED; t.planet=-1;
         t.ra=e.ra_hours; t.dec=e.dec_deg; t.mag=e.mag; t.size=e.size_arcmin;
         pool.push_back(t);
     }
 
     // ---- evaluate + score ------------------------------------------------
+    SkyGrid grid = makeGrid(noonJD, lat, lon);
+    std::vector<double> sinAlt(grid.N);
     std::vector<Ranked> ranked;
-    for (Target& t : pool){
+    for (const Target& t : pool){
         double visThresh = (t.kind==K_FIXED) ? 20.0 : 10.0;   // photographic vs solar-system
-        Events ev = findEvents(t, noonJD, lat, lon, winStart, winEnd, visThresh);
+        // A fixed object culminates at 90 - |lat - dec|; skip any that can
+        // never clear the threshold without sampling them.
+        if (t.kind==K_FIXED && 90.0 - fabs(lat - t.dec) < visThresh) continue;
+        sinAltSeries(t, grid, sinAlt.data());
+        Events ev = findEvents(grid, sinAlt.data(), winStart, winEnd, visThresh);
         if (!ev.everUp) continue;                             // not observable this night
 
         // magnitude / size at mid-window for moving bodies
@@ -792,14 +881,14 @@ int main(int argc, char** argv){
         // scoring components (0..1)
         double durScore = ev.visHours / (winHrs > 0 ? winHrs : 1.0);
         if (durScore > 1) durScore = 1;
-        double brightScore = (12.0 - mag) / 14.0;             // mag 12 ->0, -2 ->1
+        double brightScore = (kMagFaint - mag) / (kMagFaint + 2.0);   // -2 ->1, kMagFaint ->0
         if (brightScore < 0) brightScore = 0; if (brightScore > 1) brightScore = 1;
         double altScore = ev.peakAlt > 0 ? sind(ev.peakAlt) : 0.0;
         double timeScore = 1.0 - fabs(ev.peakJD - winMid) / (halfWin > 0 ? halfWin : 1.0);
         if (timeScore < 0) timeScore = 0;
         double meridScore = altScore * (0.5 + 0.5 * timeScore);
 
-        double score = 0.35*durScore + 0.30*brightScore + 0.35*meridScore;
+        double score = kWDur*durScore + kWBright*brightScore + kWMerid*meridScore;
 
         Ranked r; r.t=t; r.ev=ev; r.score=score; r.dispMag=mag; r.dispSize=size;
         ranked.push_back(r);
@@ -812,15 +901,19 @@ int main(int argc, char** argv){
     double mMag, mSize, mIllum; moonMagSize(winMid, mMag, mSize, mIllum);
 
     // ---- build the report (to both stdout and the text file) -------------
+    static const char* kRuleEq =
+        "==============================================================================================\n";
+    static const char* kRuleDash =
+        "----------------------------------------------------------------------------------------------\n";
     std::string out;
     char line[512];
     auto emit = [&](const char* s){ out += s; };
 
+    emit(kRuleEq);
     snprintf(line,sizeof(line),
-        "======================================================================================\n"
-        " NIGHTSKY  -  top %d objects for the night of %04d-%02d-%02d (evening)\n"
-        "======================================================================================\n",
+        " NIGHTSKY  -  top %d objects for the night of %04d-%02d-%02d (evening)\n",
         count, yy, mo, dd); emit(line);
+    emit(kRuleEq);
     snprintf(line,sizeof(line),
         " Location : %+.4f, %+.4f  (%s)\n", lat, lon, locSource); emit(line);
     snprintf(line,sizeof(line),
@@ -838,11 +931,11 @@ int main(int argc, char** argv){
     if (noSunset || noSunrise){ emit(" Note     : sun does not cross horizon (polar) - used civil-night hours\n"); }
     snprintf(line,sizeof(line),
         " Times are local (UTC%+05.1f).  Rise/Set at 0deg horizon, transit=meridian.\n", tzHours); emit(line);
-    emit("--------------------------------------------------------------------------------------\n");
+    emit(kRuleDash);
     snprintf(line,sizeof(line),
-        " %-3s %-8s %-22s %-9s %6s %8s  %5s %5s %5s %6s\n",
+        " %-4s %-10s %-22s %-9s %6s %8s  %5s %5s %5s %6s\n",
         "#","ID","Name","Type","Mag","Size","Rise","Trans","Set","MaxAlt"); emit(line);
-    emit("--------------------------------------------------------------------------------------\n");
+    emit(kRuleDash);
 
     int rank = 1;
     for (const Ranked& r : ranked){
@@ -851,20 +944,23 @@ int main(int argc, char** argv){
         std::string set  = r.ev.hasSet  ? fmtLocalHM(r.ev.setJD,  tzHours) : " up  ";
         std::string tr   = fmtLocalHM(r.ev.transitJD, tzHours);
         snprintf(line,sizeof(line),
-            " %-3d %-8s %-22s %-9s %6.1f %8s  %5s %5s %5s %5.0f deg\n",
-            rank++, r.t.id.c_str(), nm.c_str(), typeName(r.t.type),
-            r.dispMag, fmtSize(r.dispSize).c_str(),
+            " %-4d %-10s %-22s %-9s %6s %8s  %5s %5s %5s %5.0f deg\n",
+            rank++, r.t.id, nm.c_str(), typeName(r.t.type),
+            fmtMag(r.dispMag).c_str(), fmtSize(r.dispSize).c_str(),
             rise.c_str(), tr.c_str(), set.c_str(),
             r.ev.peakAlt);
         emit(line);
     }
-    emit("--------------------------------------------------------------------------------------\n");
-    emit(" Ranking = 0.35*visibility-duration + 0.30*brightness + 0.35*meridian-favourability.\n");
+    emit(kRuleDash);
+    snprintf(line,sizeof(line),
+        " Ranking = %.2f*visibility-duration + %.2f*brightness + %.2f*meridian-favourability.\n",
+        kWDur, kWBright, kWMerid); emit(line);
     emit(" Deep-sky counted as visible above 20deg; solar-system above 10deg.\n");
     snprintf(line,sizeof(line),
-        " Objects: Moon, planets, and %zu Messier + bright NGC/IC/Caldwell deep-sky targets.\n",
-        cat.size()); emit(line);
-    emit("======================================================================================\n");
+        " Objects: Moon, planets, and %u deep-sky objects (Messier, NGC/IC, Caldwell, groups).\n"
+        " Deep-sky data from OpenNGC (CC BY-SA 4.0). Mag is V where known, else B. '--' = not catalogued.\n",
+        cat.count); emit(line);
+    emit(kRuleEq);
 
     // ---- output ----------------------------------------------------------
     fputs(out.c_str(), stdout);
